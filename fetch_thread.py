@@ -115,7 +115,7 @@ if __name__ == "__main__":
     reddit_thread = fetch_reddit_thread_all_toplevel_correct(url)
 
     if reddit_thread:
-        filename = "Application_Processing_Data.json"
+        filename = "processing_timelines_raw_data.json"
 
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(reddit_thread, f, ensure_ascii=False, indent=4)
