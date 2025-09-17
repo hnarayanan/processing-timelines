@@ -2,31 +2,33 @@
 """
 Extract + normalise UK naturalisation timelines from Reddit-style JSON into TSV.
 
-Design:
-- Minimal code; heavy, explicit instructions in the prompt.
-- One API call per comment (robust to large threads).
-- Strictly output 6 fields (Eligibility, Application Method, Application Date, Biometric Date, Approval Date, Ceremony Date).
+Key points:
+- One API call per comment; writes ONE ROW AT A TIME (fail-safe if a later call errors).
+- First TSV column is `Comment ID` so you can match and skip in future runs.
+- Heavy instructions in the prompt; minimal code logic.
 - Dates must be ISO "YYYY-MM-DD" or the literal "N/A".
-- Eligibility is a concise canonical label (see prompt) with optional suffixes.
-- Application Method is one of: Online, Paper, Other.
-- If a comment isn’t a timeline, we skip it.
+- Eligibility is one of a small, robust set (see prompt) with optional " (+ Marriage)" suffix.
+- Application Method ∈ {Online, Paper, Other}.
+- Non-timeline comments are skipped.
 
 Usage:
   OPENAI_API_KEY=... python extract_timelines.py input.json output.tsv --model gpt-4o-mini
 
-Notes:
-- Keeps things simple by using Chat Completions with response_format=json_object.
-- Writes incrementally: opens the output in append mode, writes the header once (if empty),
-  writes a single row immediately after each successful parse, and flushes per row.
-  To start fresh, delete the output file before re-running.
+Env:
+  OPENAI_MODEL (default: gpt-5)
+  RATE_LIMIT_DELAY_SEC (default: 0.3)
 """
 
-import argparse, json, os, sys, time
-from typing import Any
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Any, Set
 
 # ---- Config ----
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
-RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.3"))  # gentle pacing
+RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.1"))  # gentle pacing
 
 SYSTEM_PROMPT = """You are a careful information normaliser. Extract exactly ONE timeline row
 from a single Reddit-style comment body. Many comments are messy or include edits; you must
@@ -106,48 +108,68 @@ TSV_HEADER = "\t".join([
     "Ceremony Date",
 ])
 
-def _canonical_eligibility(model_value: str, body: str) -> str:
-    """
-    Pick the best eligibility base + suffixes from both the model's output and raw body text.
-    Priority bases (checked by keywords):
-      EUSS, MN1 (Child), Form T, BNO, Armed Forces, ILR (default)
-    Optional suffixes: (+ Marriage), (+ DV), (+ Refugee)
-    """
-    text = f"{model_value} || {body}".lower()
-
-    # Base detection (priority order to avoid misclassifying children/BNO/etc. as ILR)
-    if any(k in text for k in ["euss", "settled status", "eu settlement", "eu settled"]):
+def sanity_normalise_eligibility(value: str) -> str:
+    v = (value or "").strip()
+    upper = v.upper()
+    # Detect base
+    if "EUSS" in upper or "SETTLED STATUS" in upper or "EU SETTLED" in upper:
         base = "EUSS"
-    elif any(k in text for k in ["mn1", "minor child", "child application", "registration of a minor"]):
-        base = "MN1 (Child)"
-    elif "form t" in text or ("born in the uk" in text and "10" in text and "year" in text):
+    elif "MN1" in upper:
+        base = "MN1"
+    elif "FORM T" in upper:
         base = "Form T"
-    elif any(k in text for k in ["bno", "british national (overseas)"]):
-        base = "BNO"
-    elif "armed forces" in text or "hm forces" in text:
+    elif "ARMED" in upper:
         base = "Armed Forces"
+    elif "BNO" in upper:
+        base = "BNO"
     else:
-        # Default catch-all: ILR (covers Tier 2/SWV/Ancestry/Refugee/GT → ILR narratives)
         base = "ILR"
 
-    # Suffixes (can add more than one if clearly stated)
-    suffixes = []
-    if any(k in text for k in ["married to british", "british spouse", "spouse of a british", "uk spouse", "married to a british"]):
-        suffixes.append(" (+ Marriage)")
-    if any(k in text for k in ["ilrdv", "domestic violence"]):
-        suffixes.append(" (+ DV)")
-    if "refugee" in text:
-        suffixes.append(" (+ Refugee)")
+    # Marriage suffix?
+    suffix = " (+ Marriage)" if (
+        "MARRIAGE" in upper or "MARRIED TO BRITISH" in upper
+        or "BRITISH SPOUSE" in upper or "SPOUSE OF A BRITISH" in upper
+        or "(+ MARRIAGE)" in upper
+    ) else ""
 
-    return base + "".join(suffixes)
+    return base + suffix
+
+def sanity_norm_date(x: Any) -> str:
+    val = str(x or "").strip()
+    if val == "N/A":
+        return val
+    # Light format check; rely on model for parsing/formatting
+    if len(val) == 10 and val[4] == "-" and val[7] == "-":
+        return val
+    return "N/A"
+
+def read_cached_ids(tsv_path: str) -> Set[str]:
+    ids: Set[str] = set()
+    if not tsv_path or not os.path.exists(tsv_path):
+        return ids
+    try:
+        with open(tsv_path, "r", encoding="utf-8") as f:
+            first = True
+            for line in f:
+                if first:
+                    first = False
+                    continue  # skip header
+                parts = line.rstrip("\n").split("\t")
+                if parts and parts[0]:
+                    ids.add(parts[0])
+    except Exception as e:
+        print(f"[warn] Could not read cache TSV '{tsv_path}': {e}", file=sys.stderr)
+    return ids
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input_json", help="Path to input JSON (with top-level 'comments' array).")
-    parser.add_argument("output_tsv", help="Path to write the TSV.")
+    parser.add_argument("output_tsv", help="Path to write/append the TSV.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--cache-tsv", default=None, help="Optional TSV to use as cache of processed comment_ids.")
     args = parser.parse_args()
 
+    # Load input
     try:
         with open(args.input_json, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -160,36 +182,54 @@ def main():
         print("Input JSON missing 'comments' array.", file=sys.stderr)
         sys.exit(1)
 
-    # Lazy import to keep the script dependency-light.
+    # Build the processed cache from:
+    # 1) --cache-tsv (if provided)
+    # 2) existing output file (if exists)
+    processed_ids: Set[str] = set()
+    if args.cache_tsv:
+        processed_ids |= read_cached_ids(args.cache_tsv)
+    if os.path.exists(args.output_tsv):
+        processed_ids |= read_cached_ids(args.output_tsv)
+
+    # Open output TSV (append if exists, else create and write header)
+    new_file = not os.path.exists(args.output_tsv)
     try:
-        from openai import OpenAI
+        out_f = open(args.output_tsv, "a" if not new_file else "w", encoding="utf-8", newline="")
     except Exception as e:
-        print("Please install the official OpenAI Python SDK: pip install openai", file=sys.stderr)
+        print(f"Failed to open output TSV for writing: {e}", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI()
-
-    # Prepare output file for incremental writes (append mode).
-    rows_written = 0
-    need_header = not os.path.exists(args.output_tsv) or os.path.getsize(args.output_tsv) == 0
-    try:
-        out_f = open(args.output_tsv, "a", encoding="utf-8", newline="")
-    except Exception as e:
-        print(f"Failed to open output TSV for appending: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        if need_header:
+    with out_f:
+        if new_file:
             out_f.write(TSV_HEADER + "\n")
             out_f.flush()
+
+        # OpenAI client
+        try:
+            from openai import OpenAI
+        except Exception:
+            print("Please install the official OpenAI Python SDK: pip install openai", file=sys.stderr)
+            sys.exit(1)
+
+        client = OpenAI()
+
+        total_written = 0
+        total_skipped_cached = 0
 
         for idx, c in enumerate(comments, start=1):
             print(c)
             body = c.get("body", "")
-            if not body or not isinstance(body, str):
+            comment_id = c.get("comment_id") or c.get("name") or c.get("id") or f"c{idx:06d}"
+
+            if not isinstance(body, str) or not body.strip():
                 continue
 
-            # Build the chat with strict JSON object response.
+            # Skip if we've already processed this comment_id
+            if comment_id in processed_ids:
+                total_skipped_cached += 1
+                continue
+
+            # Call model for NEW comments only
             try:
                 resp = client.chat.completions.create(
                     model=args.model,
@@ -199,21 +239,18 @@ def main():
                         {"role": "user", "content": USER_PROMPT_TEMPLATE.format(body=body)},
                     ],
                 )
-            except Exception as e:
-                print(f"[warn] OpenAI call failed for comment #{idx}: {e}", file=sys.stderr)
-                if RATE_LIMIT_DELAY_SEC:
-                    time.sleep(RATE_LIMIT_DELAY_SEC)
-                continue
-
-            try:
                 content = resp.choices[0].message.content
                 parsed = json.loads(content)
             except Exception as e:
-                print(f"[warn] Could not parse JSON for comment #{idx}: {e}", file=sys.stderr)
+                print(f"[warn] Comment {comment_id}: could not parse model JSON ({e}).", file=sys.stderr)
+                # Show raw content for debugging once
                 try:
-                    print(f"[warn] Model output was:\n{resp.choices[0].message.content}", file=sys.stderr)
+                    raw = resp.choices[0].message.content  # may not exist if request failed earlier
+                    print(f"[warn] Raw model output:\n{raw}", file=sys.stderr)
                 except Exception:
                     pass
+                if RATE_LIMIT_DELAY_SEC:
+                    time.sleep(RATE_LIMIT_DELAY_SEC)
                 continue
 
             if parsed.get("skip") is True:
@@ -221,44 +258,31 @@ def main():
                     time.sleep(RATE_LIMIT_DELAY_SEC)
                 continue
 
-            # ---- Eligibility (enhanced, but still concise) ----
-            eligibility = str(parsed.get("eligibility", "")).strip()
-            eligibility_out = _canonical_eligibility(eligibility, body)
-
-            def norm(x: Any) -> str:
-                val = str(x or "").strip()
-                # Enforce "YYYY-MM-DD" or "N/A" only (we rely on the model to do the heavy lifting).
-                if val == "N/A":
-                    return val
-                return val if len(val) == 10 and val[4] == "-" and val[7] == "-" else "N/A"
+            eligibility_out = sanity_normalise_eligibility(parsed.get("eligibility", "ILR"))
+            application_method = str(parsed.get("application_method", "Online")).strip().title()
+            if application_method not in {"Online", "Paper", "Other"}:
+                application_method = "Online"
 
             row = [
+                comment_id,
                 eligibility_out,
-                str(parsed.get("application_method", "Online")).strip().title(),
-                norm(parsed.get("application_date")),
-                norm(parsed.get("biometric_date")),
-                norm(parsed.get("approval_date")),
-                norm(parsed.get("ceremony_date")),
+                application_method,
+                sanity_norm_date(parsed.get("application_date")),
+                sanity_norm_date(parsed.get("biometric_date")),
+                sanity_norm_date(parsed.get("approval_date")),
+                sanity_norm_date(parsed.get("ceremony_date")),
             ]
 
-            # Write this row immediately and flush.
-            try:
-                out_f.write("\t".join(row) + "\n")
-                out_f.flush()
-                rows_written += 1
-            except Exception as e:
-                print(f"[warn] Failed to write a row for comment #{idx}: {e}", file=sys.stderr)
+            # Write ONE ROW immediately and flush
+            out_f.write("\t".join(row) + "\n")
+            out_f.flush()
+            processed_ids.add(comment_id)  # also add to in-memory cache for this run
+            total_written += 1
 
             if RATE_LIMIT_DELAY_SEC:
                 time.sleep(RATE_LIMIT_DELAY_SEC)
 
-    finally:
-        try:
-            out_f.close()
-        except Exception:
-            pass
-
-    print(f"Wrote {rows_written} row(s) to {args.output_tsv}")
+        print(f"Wrote {total_written} new row(s) to {args.output_tsv} (skipped {total_skipped_cached} cached).")
 
 if __name__ == "__main__":
     main()
