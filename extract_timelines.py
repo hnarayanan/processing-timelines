@@ -7,7 +7,7 @@ Design:
 - One API call per comment (robust to large threads).
 - Strictly output 6 fields (Eligibility, Application Method, Application Date, Biometric Date, Approval Date, Ceremony Date).
 - Dates must be ISO "YYYY-MM-DD" or the literal "N/A".
-- Eligibility is canonical base (ILR or EUSS) plus an optional " (+ Marriage)" suffix when a British-spouse path is clearly stated.
+- Eligibility is a concise canonical label (see prompt) with optional suffixes.
 - Application Method is one of: Online, Paper, Other.
 - If a comment isn’t a timeline, we skip it.
 
@@ -47,13 +47,21 @@ STRICT RULES:
 1) If the comment does NOT clearly contain a citizenship timeline with at least an eligibility AND one date,
    return skip=true and put "N/A" for all date fields. Otherwise skip=false.
 
-2) ELIGIBILITY (canonical):
-   - Use ONLY these bases: "ILR" or "EUSS".
-     * "ILR" covers: ILR / Indefinite Leave to Remain; routes like Tier 2/Skilled Worker→ILR, Ancestry→ILR, Refugee→ILR, Global Talent→ILR, etc.
-     * "EUSS" covers: EU Settlement / EU Settled Status / Settled Status (under the EU Settlement Scheme).
-   - If the comment clearly indicates a British spouse path (e.g., “married to British citizen”, “British spouse”, “spouse of a British citizen”),
-     append the exact suffix " (+ Marriage)" to the base (e.g., "ILR (+ Marriage)" or "EUSS (+ Marriage)").
-   - Ignore all other descriptors in the final eligibility string (keep it concise as above).
+2) ELIGIBILITY (canonical, concise):
+   Choose the SINGLE best base from this list, based on the comment:
+     - "ILR"                (Indefinite Leave to Remain; includes Tier 2/Skilled Worker→ILR, Ancestry→ILR, Refugee→ILR, Global Talent→ILR, etc.)
+     - "EUSS"               (EU Settlement Scheme / Settled Status)
+     - "MN1 (Child)"        (registration of a minor under MN1)
+     - "Form T"             (born in UK, 10 years’ residence route)
+     - "BNO"                (British National (Overseas) route)
+     - "Armed Forces"       (HM Forces routes)
+   Then, if clearly and explicitly applicable, append ONE or more of these suffixes (in this order):
+     - " (+ Marriage)"   – spouse of a British citizen / British spouse route
+     - " (+ DV)"         – Domestic Violence concession/route (e.g., ILRDV)
+     - " (+ Refugee)"    – refugee route stated explicitly
+   Examples: "ILR", "ILR (+ Marriage)", "MN1 (Child)", "Form T", "Armed Forces", "EUSS (+ Marriage)".
+
+   Keep it short; do not include extra descriptors (visa history, years, councils, etc.) in the final eligibility string.
 
 3) APPLICATION METHOD:
    - Map to exactly one of: Online, Paper, Other.
@@ -81,7 +89,8 @@ USER_PROMPT_TEMPLATE = """COMMENT BODY (verbatim):
 {body}
 
 Please return the JSON object as specified. Remember:
-- eligibility must be "ILR" or "EUSS" (+ optional " (+ Marriage)").
+- eligibility must be one of: ILR, EUSS, MN1 (Child), Form T, BNO, Armed Forces
+  (+ optional suffixes: " (+ Marriage)", " (+ DV)", " (+ Refugee)")
 - application_method ∈ {{Online, Paper, Other}}
 - all dates → "YYYY-MM-DD" or "N/A"
 - choose the *latest* values if there are edits/updates
@@ -96,6 +105,41 @@ TSV_HEADER = "\t".join([
     "Approval Date",
     "Ceremony Date",
 ])
+
+def _canonical_eligibility(model_value: str, body: str) -> str:
+    """
+    Pick the best eligibility base + suffixes from both the model's output and raw body text.
+    Priority bases (checked by keywords):
+      EUSS, MN1 (Child), Form T, BNO, Armed Forces, ILR (default)
+    Optional suffixes: (+ Marriage), (+ DV), (+ Refugee)
+    """
+    text = f"{model_value} || {body}".lower()
+
+    # Base detection (priority order to avoid misclassifying children/BNO/etc. as ILR)
+    if any(k in text for k in ["euss", "settled status", "eu settlement", "eu settled"]):
+        base = "EUSS"
+    elif any(k in text for k in ["mn1", "minor child", "child application", "registration of a minor"]):
+        base = "MN1 (Child)"
+    elif "form t" in text or ("born in the uk" in text and "10" in text and "year" in text):
+        base = "Form T"
+    elif any(k in text for k in ["bno", "british national (overseas)"]):
+        base = "BNO"
+    elif "armed forces" in text or "hm forces" in text:
+        base = "Armed Forces"
+    else:
+        # Default catch-all: ILR (covers Tier 2/SWV/Ancestry/Refugee/GT → ILR narratives)
+        base = "ILR"
+
+    # Suffixes (can add more than one if clearly stated)
+    suffixes = []
+    if any(k in text for k in ["married to british", "british spouse", "spouse of a british", "uk spouse", "married to a british"]):
+        suffixes.append(" (+ Marriage)")
+    if any(k in text for k in ["ilrdv", "domestic violence"]):
+        suffixes.append(" (+ DV)")
+    if "refugee" in text:
+        suffixes.append(" (+ Refugee)")
+
+    return base + "".join(suffixes)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -157,7 +201,6 @@ def main():
                 )
             except Exception as e:
                 print(f"[warn] OpenAI call failed for comment #{idx}: {e}", file=sys.stderr)
-                # Best-effort pacing even on failures
                 if RATE_LIMIT_DELAY_SEC:
                     time.sleep(RATE_LIMIT_DELAY_SEC)
                 continue
@@ -172,30 +215,21 @@ def main():
                 except Exception:
                     pass
                 continue
-            except Exception as e:
-                print(e)
-                continue
 
             if parsed.get("skip") is True:
-                # Gentle pacing helps with bursty inputs and avoids rate spikes.
                 if RATE_LIMIT_DELAY_SEC:
                     time.sleep(RATE_LIMIT_DELAY_SEC)
                 continue
 
-            # Safeguard: coerce values to strings and ensure only the two eligibility bases appear.
-            eligibility = str(parsed.get("eligibility", "ILR")).strip()
-            base = "EUSS" if eligibility.upper().startswith("EUSS") else "ILR"
-            if "marriage" in eligibility.lower():
-                eligibility_out = f"{base} (+ Marriage)"
-            else:
-                eligibility_out = base
+            # ---- Eligibility (enhanced, but still concise) ----
+            eligibility = str(parsed.get("eligibility", "")).strip()
+            eligibility_out = _canonical_eligibility(eligibility, body)
 
             def norm(x: Any) -> str:
                 val = str(x or "").strip()
                 # Enforce "YYYY-MM-DD" or "N/A" only (we rely on the model to do the heavy lifting).
                 if val == "N/A":
                     return val
-                # very light sanity check
                 return val if len(val) == 10 and val[4] == "-" and val[7] == "-" else "N/A"
 
             row = [
@@ -215,7 +249,6 @@ def main():
             except Exception as e:
                 print(f"[warn] Failed to write a row for comment #{idx}: {e}", file=sys.stderr)
 
-            # Gentle pacing helps with bursty inputs and avoids rate spikes.
             if RATE_LIMIT_DELAY_SEC:
                 time.sleep(RATE_LIMIT_DELAY_SEC)
 
