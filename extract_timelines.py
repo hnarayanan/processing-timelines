@@ -26,9 +26,8 @@ import sys
 import time
 from typing import Any, Set
 
-# ---- Config ----
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
-RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.1"))  # gentle pacing
+RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.1"))
 
 SYSTEM_PROMPT = """You are a careful information normaliser. Extract exactly ONE timeline row
 from a single Reddit-style comment body. Many comments are messy or include edits; you must
@@ -100,6 +99,7 @@ Please return the JSON object as specified. Remember:
 """
 
 TSV_HEADER = "\t".join([
+    "Comment ID",
     "Eligibility",
     "Application Method",
     "Application Date",
@@ -226,11 +226,12 @@ def main():
 
             # Skip if we've already processed this comment_id
             if comment_id in processed_ids:
+                print("--- Skipping this comment ---")
                 total_skipped_cached += 1
                 continue
 
-            # Call model for NEW comments only
             try:
+                print("--- Processing this comment ---")
                 resp = client.chat.completions.create(
                     model=args.model,
                     response_format={"type": "json_object"},
@@ -243,9 +244,9 @@ def main():
                 parsed = json.loads(content)
             except Exception as e:
                 print(f"[warn] Comment {comment_id}: could not parse model JSON ({e}).", file=sys.stderr)
-                # Show raw content for debugging once
+
                 try:
-                    raw = resp.choices[0].message.content  # may not exist if request failed earlier
+                    raw = resp.choices[0].message.content
                     print(f"[warn] Raw model output:\n{raw}", file=sys.stderr)
                 except Exception:
                     pass
@@ -273,10 +274,9 @@ def main():
                 sanity_norm_date(parsed.get("ceremony_date")),
             ]
 
-            # Write ONE ROW immediately and flush
             out_f.write("\t".join(row) + "\n")
             out_f.flush()
-            processed_ids.add(comment_id)  # also add to in-memory cache for this run
+            processed_ids.add(comment_id)
             total_written += 1
 
             if RATE_LIMIT_DELAY_SEC:
