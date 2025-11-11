@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
-"""Extract + normalise UK naturalisation timelines from Reddit-style
-JSON into TSV. It handles comment updates by tracking body hashes and
-intelligently merging dates.
-
-Key points:
-- One API call per comment; writes ONE ROW AT A TIME (fail-safe if a later call errors).
-- First TSV column is `Comment ID` so you can match and skip in future runs.
-- Heavy instructions in the prompt; minimal code logic.
-- Dates must be ISO "YYYY-MM-DD" or the literal "N/A".
-- Eligibility is one of a small, robust set (see prompt) with optional " (+ Marriage)" suffix.
-- Application Method ∈ {Online, Paper, Other}.
-- Non-timeline comments are skipped.
-- Tracks comment body hashes to detect edits
-- Re-processes edited comments and merges new dates with existing data
-- Preserves existing dates while filling in N/A values
-- Creates backups before rewriting TSV
+"""
+Extract + normalise UK naturalisation timelines from Reddit-style JSON into TSV.
+Handles comment updates by tracking body hashes and intelligently merging dates.
 
 Usage:
   OPENAI_API_KEY=... python extract_timelines.py input.json output.tsv --model gpt-4o-mini
 
 Env:
   OPENAI_MODEL (default: gpt-5)
-  RATE_LIMIT_DELAY_SEC (default: 0.3)
+  RATE_LIMIT_DELAY_SEC (default: 0.1)
 """
 
 import argparse
@@ -384,6 +371,28 @@ def main():
 
     client = OpenAI()
 
+    # Create backup BEFORE we start processing
+    if not args.no_backup and os.path.exists(args.output_tsv):
+        backup_path = f"{args.output_tsv}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            shutil.copy2(args.output_tsv, backup_path)
+            print(f"✓ Created backup: {backup_path}")
+        except Exception as e:
+            print(f"[warn] Could not create backup: {e}", file=sys.stderr)
+
+    # Open in-progress file for incremental writes (CRASH-SAFE)
+    inprogress_path = f"{args.output_tsv}.inprogress"
+    try:
+        inprogress_file = open(inprogress_path, "w", encoding="utf-8", newline="")
+        inprogress_file.write(TSV_HEADER + "\n")
+        inprogress_file.flush()
+    except Exception as e:
+        print(f"Failed to open in-progress file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Track which comments we've written to inprogress file
+    written_to_inprogress = set()
+
     # Tracking counters
     stats = {
         "new": 0,
@@ -393,72 +402,125 @@ def main():
         "errors": 0,
     }
 
-    # Process each comment
-    for idx, c in enumerate(comments, start=1):
-        body = c.get("body", "")
-        comment_id = c.get("comment_id") or c.get("name") or c.get("id") or f"c{idx:06d}"
+    try:
+        # Process each comment
+        for idx, c in enumerate(comments, start=1):
+            body = c.get("body", "")
+            comment_id = c.get("comment_id") or c.get("name") or c.get("id") or f"c{idx:06d}"
 
-        if not isinstance(body, str) or not body.strip():
-            continue
+            if not isinstance(body, str) or not body.strip():
+                continue
 
-        body_hash = compute_body_hash(body)
-        existing_row = existing_data.get(comment_id)
+            body_hash = compute_body_hash(body)
+            existing_row = existing_data.get(comment_id)
 
-        # Determine if we need to process this comment
-        should_process = False
-        reason = ""
+            # Determine if we need to process this comment
+            should_process = False
+            reason = ""
 
-        if existing_row is None:
-            should_process = True
-            reason = "new comment"
-        elif existing_row.body_hash != body_hash:
-            should_process = True
-            reason = "comment edited"
-        else:
-            # Already processed and unchanged
-            stats["unchanged"] += 1
-            if idx % 50 == 0:
-                print(f"[{idx}/{len(comments)}] {comment_id}: unchanged")
-            continue
-
-        print(f"[{idx}/{len(comments)}] {comment_id}: processing ({reason})")
-
-        # Process the comment
-        new_row = process_comment(comment_id, body, args.model, client)
-
-        if new_row is None:
-            stats["skipped"] += 1
-            # Remove from data if it was previously there but now should be skipped
-            if comment_id in existing_data:
-                del existing_data[comment_id]
-        else:
             if existing_row is None:
-                # Brand new entry
-                existing_data[comment_id] = new_row
-                stats["new"] += 1
-                print(f"  → Added new timeline")
+                should_process = True
+                reason = "new comment"
+            elif existing_row.body_hash != body_hash:
+                should_process = True
+                reason = "comment edited"
             else:
-                # Merge with existing data
-                merged_row = existing_row.merge_with(new_row)
-                existing_data[comment_id] = merged_row
-                stats["updated"] += 1
-                print(f"  → Updated timeline (merged dates)")
+                # Already processed and unchanged - write existing row to inprogress
+                stats["unchanged"] += 1
+                if idx % 50 == 0:
+                    print(f"[{idx}/{len(comments)}] {comment_id}: unchanged")
 
-        # Rate limiting
-        if RATE_LIMIT_DELAY_SEC:
-            time.sleep(RATE_LIMIT_DELAY_SEC)
+                # Write unchanged row to inprogress file
+                if comment_id not in written_to_inprogress:
+                    inprogress_file.write(existing_row.to_tsv_row() + "\n")
+                    inprogress_file.flush()
+                    written_to_inprogress.add(comment_id)
+                continue
 
-    # Write all data back to TSV
+            print(f"[{idx}/{len(comments)}] {comment_id}: processing ({reason})")
+
+            # Process the comment
+            new_row = process_comment(comment_id, body, args.model, client)
+
+            if new_row is None:
+                stats["skipped"] += 1
+                # Remove from data if it was previously there but now should be skipped
+                if comment_id in existing_data:
+                    del existing_data[comment_id]
+                # Don't write to inprogress file (it's being removed)
+            else:
+                if existing_row is None:
+                    # Brand new entry
+                    existing_data[comment_id] = new_row
+                    stats["new"] += 1
+                    print(f"  → Added new timeline")
+                else:
+                    # Merge with existing data
+                    merged_row = existing_row.merge_with(new_row)
+                    existing_data[comment_id] = merged_row
+                    new_row = merged_row  # Use merged row for writing
+                    stats["updated"] += 1
+                    print(f"  → Updated timeline (merged dates)")
+
+                # Write to inprogress file IMMEDIATELY (crash-safe!)
+                if comment_id not in written_to_inprogress:
+                    inprogress_file.write(new_row.to_tsv_row() + "\n")
+                    inprogress_file.flush()
+                    written_to_inprogress.add(comment_id)
+
+            # Rate limiting
+            if RATE_LIMIT_DELAY_SEC:
+                time.sleep(RATE_LIMIT_DELAY_SEC)
+
+        # Write any remaining rows that weren't in the input comments but are in existing_data
+        for comment_id, row in existing_data.items():
+            if comment_id not in written_to_inprogress:
+                inprogress_file.write(row.to_tsv_row() + "\n")
+                written_to_inprogress.add(comment_id)
+
+    finally:
+        # Always close the inprogress file
+        inprogress_file.close()
+
+    # Now sort the inprogress file and write final output
     print("\n" + "="*60)
-    write_all_data(args.output_tsv, existing_data, create_backup=not args.no_backup)
+    print("📝 Finalizing output (sorting by comment ID)...")
+
+    try:
+        # Read all rows from inprogress file
+        final_data = {}
+        with open(inprogress_path, "r", encoding="utf-8") as f:
+            first = True
+            for line in f:
+                if first:
+                    first = False
+                    continue  # skip header
+                row = TimelineRow.from_tsv_row(line)
+                if row and row.comment_id:
+                    final_data[row.comment_id] = row
+
+        # Write sorted final output
+        with open(args.output_tsv, "w", encoding="utf-8", newline="") as f:
+            f.write(TSV_HEADER + "\n")
+            for comment_id in sorted(final_data.keys()):
+                f.write(final_data[comment_id].to_tsv_row() + "\n")
+
+        # Remove inprogress file
+        os.remove(inprogress_path)
+        print(f"✓ Wrote {len(final_data)} rows to {args.output_tsv}")
+
+    except Exception as e:
+        print(f"[error] Failed to finalize output: {e}", file=sys.stderr)
+        print(f"[info] Your data is safe in: {inprogress_path}", file=sys.stderr)
+        sys.exit(1)
 
     # Print summary
     print("\n📊 Summary:")
-    print(f"  New timelines added:    {stats['new']}")
+    print(f"  New timelines added:        {stats['new']}")
     print(f"  Existing timelines updated: {stats['updated']}")
-    print(f"  Unchanged timelines:    {stats['unchanged']}")
-    print(f"  Non-timeline comments:  {stats['skipped']}")
-    print(f"  Total timelines in TSV: {len(existing_data)}")
+    print(f"  Unchanged timelines:        {stats['unchanged']}")
+    print(f"  Non-timeline comments:      {stats['skipped']}")
+    print(f"  Total timelines in TSV:     {len(final_data)}")
     print("\n✅ Done!")
 
 
