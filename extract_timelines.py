@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""
-Extract + normalise UK naturalisation timelines from Reddit-style JSON into TSV.
+"""Extract + normalise UK naturalisation timelines from Reddit-style
+JSON into TSV. It handles comment updates by tracking body hashes and
+intelligently merging dates.
 
 Key points:
 - One API call per comment; writes ONE ROW AT A TIME (fail-safe if a later call errors).
@@ -10,6 +11,10 @@ Key points:
 - Eligibility is one of a small, robust set (see prompt) with optional " (+ Marriage)" suffix.
 - Application Method ∈ {Online, Paper, Other}.
 - Non-timeline comments are skipped.
+- Tracks comment body hashes to detect edits
+- Re-processes edited comments and merges new dates with existing data
+- Preserves existing dates while filling in N/A values
+- Creates backups before rewriting TSV
 
 Usage:
   OPENAI_API_KEY=... python extract_timelines.py input.json output.tsv --model gpt-4o-mini
@@ -20,11 +25,14 @@ Env:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import sys
 import time
-from typing import Any, Set
+from datetime import datetime
+from typing import Any, Dict, Optional, Set
 
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
 RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.1"))
@@ -106,11 +114,113 @@ TSV_HEADER = "\t".join([
     "Biometric Date",
     "Approval Date",
     "Ceremony Date",
+    "Body Hash",
 ])
 
+
+class TimelineRow:
+    """Represents a single timeline row with all fields."""
+
+    def __init__(
+        self,
+        comment_id: str,
+        eligibility: str,
+        application_method: str,
+        application_date: str,
+        biometric_date: str,
+        approval_date: str,
+        ceremony_date: str,
+        body_hash: str = "",
+    ):
+        self.comment_id = comment_id
+        self.eligibility = eligibility
+        self.application_method = application_method
+        self.application_date = application_date
+        self.biometric_date = biometric_date
+        self.approval_date = approval_date
+        self.ceremony_date = ceremony_date
+        self.body_hash = body_hash
+
+    def to_tsv_row(self) -> str:
+        """Convert to TSV row string."""
+        return "\t".join([
+            self.comment_id,
+            self.eligibility,
+            self.application_method,
+            self.application_date,
+            self.biometric_date,
+            self.approval_date,
+            self.ceremony_date,
+            self.body_hash,
+        ])
+
+    @classmethod
+    def from_tsv_row(cls, line: str) -> Optional['TimelineRow']:
+        """Parse a TSV row into a TimelineRow object."""
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 7:
+            return None
+
+        # Handle optional body_hash column (backwards compatibility)
+        body_hash = parts[7] if len(parts) > 7 else ""
+
+        return cls(
+            comment_id=parts[0],
+            eligibility=parts[1],
+            application_method=parts[2],
+            application_date=parts[3],
+            biometric_date=parts[4],
+            approval_date=parts[5],
+            ceremony_date=parts[6],
+            body_hash=body_hash,
+        )
+
+    def merge_with(self, other: 'TimelineRow') -> 'TimelineRow':
+        """
+        Merge this row with another, intelligently combining dates.
+        Strategy: Keep existing dates, fill in N/A values with new dates.
+        For non-date fields, prefer the newer data.
+        """
+        return TimelineRow(
+            comment_id=self.comment_id,
+            eligibility=other.eligibility,  # Use newer eligibility
+            application_method=other.application_method,  # Use newer method
+            application_date=self._merge_date(self.application_date, other.application_date),
+            biometric_date=self._merge_date(self.biometric_date, other.biometric_date),
+            approval_date=self._merge_date(self.approval_date, other.approval_date),
+            ceremony_date=self._merge_date(self.ceremony_date, other.ceremony_date),
+            body_hash=other.body_hash,  # Update to new hash
+        )
+
+    @staticmethod
+    def _merge_date(old_date: str, new_date: str) -> str:
+        """
+        Merge two date values intelligently.
+        - If old is a real date, keep it (existing data is preserved)
+        - If old is N/A and new is a real date, use new (fill in gaps)
+        - Otherwise use N/A
+        """
+        if old_date and old_date != "N/A" and old_date.strip():
+            # Old date exists and is valid, keep it
+            return old_date
+        elif new_date and new_date != "N/A" and new_date.strip():
+            # Old was N/A but new has a date, use new
+            return new_date
+        else:
+            # Both are N/A or invalid
+            return "N/A"
+
+
+def compute_body_hash(body: str) -> str:
+    """Compute a hash of the comment body to detect changes."""
+    return hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]
+
+
 def sanity_normalise_eligibility(value: str) -> str:
+    """Normalize eligibility value to standard form."""
     v = (value or "").strip()
     upper = v.upper()
+
     # Detect base
     if "EUSS" in upper or "SETTLED STATUS" in upper or "EU SETTLED" in upper:
         base = "EUSS"
@@ -134,7 +244,9 @@ def sanity_normalise_eligibility(value: str) -> str:
 
     return base + suffix
 
+
 def sanity_norm_date(x: Any) -> str:
+    """Normalize date value to YYYY-MM-DD or N/A."""
     val = str(x or "").strip()
     if val == "N/A":
         return val
@@ -143,10 +255,14 @@ def sanity_norm_date(x: Any) -> str:
         return val
     return "N/A"
 
-def read_cached_ids(tsv_path: str) -> Set[str]:
-    ids: Set[str] = set()
+
+def read_existing_data(tsv_path: str) -> Dict[str, TimelineRow]:
+    """Read existing TSV data into a dictionary keyed by comment_id."""
+    data: Dict[str, TimelineRow] = {}
+
     if not tsv_path or not os.path.exists(tsv_path):
-        return ids
+        return data
+
     try:
         with open(tsv_path, "r", encoding="utf-8") as f:
             first = True
@@ -154,22 +270,95 @@ def read_cached_ids(tsv_path: str) -> Set[str]:
                 if first:
                     first = False
                     continue  # skip header
-                parts = line.rstrip("\n").split("\t")
-                if parts and parts[0]:
-                    ids.add(parts[0])
+
+                row = TimelineRow.from_tsv_row(line)
+                if row and row.comment_id:
+                    data[row.comment_id] = row
     except Exception as e:
-        print(f"[warn] Could not read cache TSV '{tsv_path}': {e}", file=sys.stderr)
-    return ids
+        print(f"[warn] Could not read existing TSV '{tsv_path}': {e}", file=sys.stderr)
+
+    return data
+
+
+def process_comment(comment_id: str, body: str, model: str, client) -> Optional[TimelineRow]:
+    """
+    Process a single comment using the OpenAI API.
+    Returns a TimelineRow if successful, None if skipped or error.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT_TEMPLATE.format(body=body)},
+            ],
+        )
+        content = resp.choices[0].message.content
+        parsed = json.loads(content)
+    except Exception as e:
+        print(f"[warn] Comment {comment_id}: could not parse model JSON ({e}).", file=sys.stderr)
+        try:
+            raw = resp.choices[0].message.content
+            print(f"[warn] Raw model output:\n{raw}", file=sys.stderr)
+        except Exception:
+            pass
+        return None
+
+    if parsed.get("skip") is True:
+        return None
+
+    eligibility_out = sanity_normalise_eligibility(parsed.get("eligibility", "ILR"))
+    application_method = str(parsed.get("application_method", "Online")).strip().title()
+    if application_method not in {"Online", "Paper", "Other"}:
+        application_method = "Online"
+
+    body_hash = compute_body_hash(body)
+
+    return TimelineRow(
+        comment_id=comment_id,
+        eligibility=eligibility_out,
+        application_method=application_method,
+        application_date=sanity_norm_date(parsed.get("application_date")),
+        biometric_date=sanity_norm_date(parsed.get("biometric_date")),
+        approval_date=sanity_norm_date(parsed.get("approval_date")),
+        ceremony_date=sanity_norm_date(parsed.get("ceremony_date")),
+        body_hash=body_hash,
+    )
+
+
+def write_all_data(tsv_path: str, data: Dict[str, TimelineRow], create_backup: bool = True):
+    """Write all timeline data to TSV, optionally creating a backup first."""
+    if create_backup and os.path.exists(tsv_path):
+        backup_path = f"{tsv_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            shutil.copy2(tsv_path, backup_path)
+            print(f"✓ Created backup: {backup_path}")
+        except Exception as e:
+            print(f"[warn] Could not create backup: {e}", file=sys.stderr)
+    try:
+        with open(tsv_path, "w", encoding="utf-8", newline="") as f:
+            f.write(TSV_HEADER + "\n")
+            # Sort by comment_id for consistent output
+            for comment_id in sorted(data.keys()):
+                f.write(data[comment_id].to_tsv_row() + "\n")
+        print(f"✓ Wrote {len(data)} rows to {tsv_path}")
+    except Exception as e:
+        print(f"[error] Failed to write TSV: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Extract UK naturalisation timelines from Reddit JSON, tracking updates."
+    )
     parser.add_argument("input_json", help="Path to input JSON (with top-level 'comments' array).")
-    parser.add_argument("output_tsv", help="Path to write/append the TSV.")
+    parser.add_argument("output_tsv", help="Path to write/update the TSV.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--cache-tsv", default=None, help="Optional TSV to use as cache of processed comment_ids.")
+    parser.add_argument("--no-backup", action="store_true", help="Skip creating backup before rewriting TSV")
     args = parser.parse_args()
 
-    # Load input
+    # Load input JSON
     try:
         with open(args.input_json, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -182,107 +371,96 @@ def main():
         print("Input JSON missing 'comments' array.", file=sys.stderr)
         sys.exit(1)
 
-    # Build the processed cache from:
-    # 1) --cache-tsv (if provided)
-    # 2) existing output file (if exists)
-    processed_ids: Set[str] = set()
-    if args.cache_tsv:
-        processed_ids |= read_cached_ids(args.cache_tsv)
-    if os.path.exists(args.output_tsv):
-        processed_ids |= read_cached_ids(args.output_tsv)
+    # Read existing data
+    existing_data = read_existing_data(args.output_tsv)
+    print(f"📚 Loaded {len(existing_data)} existing timeline(s)")
 
-    # Open output TSV (append if exists, else create and write header)
-    new_file = not os.path.exists(args.output_tsv)
+    # Initialize OpenAI client
     try:
-        out_f = open(args.output_tsv, "a" if not new_file else "w", encoding="utf-8", newline="")
-    except Exception as e:
-        print(f"Failed to open output TSV for writing: {e}", file=sys.stderr)
+        from openai import OpenAI
+    except Exception:
+        print("Please install the official OpenAI Python SDK: pip install openai", file=sys.stderr)
         sys.exit(1)
 
-    with out_f:
-        if new_file:
-            out_f.write(TSV_HEADER + "\n")
-            out_f.flush()
+    client = OpenAI()
 
-        # OpenAI client
-        try:
-            from openai import OpenAI
-        except Exception:
-            print("Please install the official OpenAI Python SDK: pip install openai", file=sys.stderr)
-            sys.exit(1)
+    # Tracking counters
+    stats = {
+        "new": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
 
-        client = OpenAI()
+    # Process each comment
+    for idx, c in enumerate(comments, start=1):
+        body = c.get("body", "")
+        comment_id = c.get("comment_id") or c.get("name") or c.get("id") or f"c{idx:06d}"
 
-        total_written = 0
-        total_skipped_cached = 0
+        if not isinstance(body, str) or not body.strip():
+            continue
 
-        for idx, c in enumerate(comments, start=1):
-            print(c)
-            body = c.get("body", "")
-            comment_id = c.get("comment_id") or c.get("name") or c.get("id") or f"c{idx:06d}"
+        body_hash = compute_body_hash(body)
+        existing_row = existing_data.get(comment_id)
 
-            if not isinstance(body, str) or not body.strip():
-                continue
+        # Determine if we need to process this comment
+        should_process = False
+        reason = ""
 
-            # Skip if we've already processed this comment_id
-            if comment_id in processed_ids:
-                print("--- Skipping this comment ---")
-                total_skipped_cached += 1
-                continue
+        if existing_row is None:
+            should_process = True
+            reason = "new comment"
+        elif existing_row.body_hash != body_hash:
+            should_process = True
+            reason = "comment edited"
+        else:
+            # Already processed and unchanged
+            stats["unchanged"] += 1
+            if idx % 50 == 0:
+                print(f"[{idx}/{len(comments)}] {comment_id}: unchanged")
+            continue
 
-            try:
-                print("--- Processing this comment ---")
-                resp = client.chat.completions.create(
-                    model=args.model,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": USER_PROMPT_TEMPLATE.format(body=body)},
-                    ],
-                )
-                content = resp.choices[0].message.content
-                parsed = json.loads(content)
-            except Exception as e:
-                print(f"[warn] Comment {comment_id}: could not parse model JSON ({e}).", file=sys.stderr)
+        print(f"[{idx}/{len(comments)}] {comment_id}: processing ({reason})")
 
-                try:
-                    raw = resp.choices[0].message.content
-                    print(f"[warn] Raw model output:\n{raw}", file=sys.stderr)
-                except Exception:
-                    pass
-                if RATE_LIMIT_DELAY_SEC:
-                    time.sleep(RATE_LIMIT_DELAY_SEC)
-                continue
+        # Process the comment
+        new_row = process_comment(comment_id, body, args.model, client)
 
-            if parsed.get("skip") is True:
-                if RATE_LIMIT_DELAY_SEC:
-                    time.sleep(RATE_LIMIT_DELAY_SEC)
-                continue
+        if new_row is None:
+            stats["skipped"] += 1
+            # Remove from data if it was previously there but now should be skipped
+            if comment_id in existing_data:
+                del existing_data[comment_id]
+        else:
+            if existing_row is None:
+                # Brand new entry
+                existing_data[comment_id] = new_row
+                stats["new"] += 1
+                print(f"  → Added new timeline")
+            else:
+                # Merge with existing data
+                merged_row = existing_row.merge_with(new_row)
+                existing_data[comment_id] = merged_row
+                stats["updated"] += 1
+                print(f"  → Updated timeline (merged dates)")
 
-            eligibility_out = sanity_normalise_eligibility(parsed.get("eligibility", "ILR"))
-            application_method = str(parsed.get("application_method", "Online")).strip().title()
-            if application_method not in {"Online", "Paper", "Other"}:
-                application_method = "Online"
+        # Rate limiting
+        if RATE_LIMIT_DELAY_SEC:
+            time.sleep(RATE_LIMIT_DELAY_SEC)
 
-            row = [
-                comment_id,
-                eligibility_out,
-                application_method,
-                sanity_norm_date(parsed.get("application_date")),
-                sanity_norm_date(parsed.get("biometric_date")),
-                sanity_norm_date(parsed.get("approval_date")),
-                sanity_norm_date(parsed.get("ceremony_date")),
-            ]
+    # Write all data back to TSV
+    print("\n" + "="*60)
+    write_all_data(args.output_tsv, existing_data, create_backup=not args.no_backup)
 
-            out_f.write("\t".join(row) + "\n")
-            out_f.flush()
-            processed_ids.add(comment_id)
-            total_written += 1
+    # Print summary
+    print("\n📊 Summary:")
+    print(f"  New timelines added:    {stats['new']}")
+    print(f"  Existing timelines updated: {stats['updated']}")
+    print(f"  Unchanged timelines:    {stats['unchanged']}")
+    print(f"  Non-timeline comments:  {stats['skipped']}")
+    print(f"  Total timelines in TSV: {len(existing_data)}")
+    print("\n✅ Done!")
 
-            if RATE_LIMIT_DELAY_SEC:
-                time.sleep(RATE_LIMIT_DELAY_SEC)
-
-        print(f"Wrote {total_written} new row(s) to {args.output_tsv} (skipped {total_skipped_cached} cached).")
 
 if __name__ == "__main__":
     main()
