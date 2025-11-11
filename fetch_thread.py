@@ -1,7 +1,14 @@
+#!/usr/bin/env python3
+"""
+Fetch Reddit thread comments with edit tracking.
+Captures edit timestamps to help track comment updates.
+"""
+
 import requests
 import json
-import re
 import time
+from datetime import datetime
+
 
 def _fetch_remaining_comments_data(post_id, children_ids):
     """
@@ -16,10 +23,10 @@ def _fetch_remaining_comments_data(post_id, children_ids):
 
         url = "https://www.reddit.com/api/morechildren.json"
         params = {"api_type": "json", "link_id": post_id, "children": ids_string}
-        headers = {'User-Agent': 'MyCorrectedToplevelDownloader/5.0'}
+        headers = {'User-Agent': 'UKNaturalisationTimelineTracker/2.0'}
 
         print(f"    -> Fetching data for a batch of {len(chunk)} comment IDs...")
-        time.sleep(1) # Be respectful to the API
+        time.sleep(1)  # Be respectful to the API
 
         try:
             response = requests.get(url, params=params, headers=headers)
@@ -32,10 +39,12 @@ def _fetch_remaining_comments_data(post_id, children_ids):
 
     return all_comments_data
 
+
 def filter_and_parse_toplevel_comments(comment_children, post_id):
     """
     Parses a list of comment data objects, KEEPING ONLY true top-level comments.
     It does this by checking if the comment's 'parent_id' matches the post's ID.
+    Also captures edit timestamps and created timestamps.
     """
     comments = []
     for item in comment_children:
@@ -48,26 +57,43 @@ def filter_and_parse_toplevel_comments(comment_children, post_id):
         if data.get('parent_id') != post_id:
             continue
 
+        # Extract timestamps
+        created_utc = data.get('created_utc', 0)
+        edited = data.get('edited', False)
+
+        # Convert timestamps to ISO format for readability
+        created_iso = datetime.fromtimestamp(created_utc).isoformat() if created_utc else None
+        edited_iso = None
+        if edited and isinstance(edited, (int, float)):
+            edited_iso = datetime.fromtimestamp(edited).isoformat()
+
         comment = {
             'comment_id': data.get('name'),
             'author': data.get('author', '[deleted]'),
             'body': data.get('body', ''),
             'score': data.get('score', 0),
+            'created_utc': created_utc,
+            'created_iso': created_iso,
+            'edited_utc': edited if isinstance(edited, (int, float)) else None,
+            'edited_iso': edited_iso,
+            'was_edited': bool(edited),
         }
         comments.append(comment)
 
     return comments
 
-def fetch_reddit_thread_all_toplevel_correct(thread_url):
+
+def fetch_reddit_thread_all_toplevel(thread_url):
     """
     Fetches a Reddit thread and ALL of its top-level comments, correctly
     filtering out any nested replies returned by the API.
+    Includes edit tracking information.
     """
     if not thread_url.endswith('/'):
         thread_url += '/'
 
     json_url = thread_url + '.json'
-    headers = {'User-Agent': 'MyCorrectedToplevelDownloader/5.0'}
+    headers = {'User-Agent': 'UKNaturalisationTimelineTracker/2.0'}
 
     print(f"📡 Fetching initial data from: {json_url}")
 
@@ -98,9 +124,26 @@ def fetch_reddit_thread_all_toplevel_correct(thread_url):
                 newly_fetched_comments = filter_and_parse_toplevel_comments(remaining_comments_data, post_id)
                 top_level_comments.extend(newly_fetched_comments)
 
+        # Sort comments by creation time (oldest first)
+        # top_level_comments.sort(key=lambda x: x.get('created_utc', 0))
+
+        # Count edited comments
+        edited_count = sum(1 for c in top_level_comments if c.get('was_edited'))
+
         thread = {
-            'post': {'title': post_data.get('title'), 'author': post_data.get('author'), 'selftext': post_data.get('selftext')},
-            'comments': top_level_comments
+            'post': {
+                'title': post_data.get('title'),
+                'author': post_data.get('author'),
+                'selftext': post_data.get('selftext'),
+                'created_utc': post_data.get('created_utc'),
+                'post_id': post_id,
+            },
+            'comments': top_level_comments,
+            'metadata': {
+                'total_comments': len(top_level_comments),
+                'edited_comments': edited_count,
+                'fetch_timestamp': datetime.now().isoformat(),
+            }
         }
 
         return thread
@@ -109,15 +152,38 @@ def fetch_reddit_thread_all_toplevel_correct(thread_url):
         print(f"❌ An error occurred: {e}")
         return None
 
-if __name__ == "__main__":
-    url = "https://www.reddit.com/r/ukvisa/comments/1hkp9zl/naturalisation_citizenship_application_processing/"
 
-    reddit_thread = fetch_reddit_thread_all_toplevel_correct(url)
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Fetch Reddit thread with all top-level comments and edit tracking"
+    )
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default="https://www.reddit.com/r/ukvisa/comments/1hkp9zl/naturalisation_citizenship_application_processing/",
+        help="Reddit thread URL"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="processing_timelines_raw_data.json",
+        help="Output JSON file (default: processing_timelines_raw_data.json)"
+    )
+    args = parser.parse_args()
+
+    reddit_thread = fetch_reddit_thread_all_toplevel(args.url)
 
     if reddit_thread:
-        filename = "processing_timelines_raw_data.json"
-
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(args.output, 'w', encoding='utf-8') as f:
             json.dump(reddit_thread, f, ensure_ascii=False, indent=4)
 
-        print(f"\n✅ Success! All {len(reddit_thread['comments'])} top-level comments correctly saved to '{filename}'")
+        metadata = reddit_thread['metadata']
+        print(f"\n✅ Success! Saved to '{args.output}'")
+        print(f"   Total comments: {metadata['total_comments']}")
+        print(f"   Edited comments: {metadata['edited_comments']}")
+        print(f"   Fetch time: {metadata['fetch_timestamp']}")
+
+
+if __name__ == "__main__":
+    main()
