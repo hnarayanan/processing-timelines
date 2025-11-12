@@ -362,6 +362,19 @@ def main():
     existing_data = read_existing_data(args.output_tsv)
     print(f"📚 Loaded {len(existing_data)} existing timeline(s)")
 
+    # Load skipped cache (non-timeline comments)
+    skipped_cache = {}
+    skipped_file = f"{args.output_tsv}.skipped"
+    if os.path.exists(skipped_file):
+        try:
+            with open(skipped_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) == 2:
+                        skipped_cache[parts[0]] = parts[1]
+        except Exception as e:
+            print(f"[warn] Could not read skipped cache: {e}", file=sys.stderr)
+
     # Initialize OpenAI client
     try:
         from openai import OpenAI
@@ -411,8 +424,22 @@ def main():
             if not isinstance(body, str) or not body.strip():
                 continue
 
+            # Skip deleted/removed - preserve old data if exists
+            if body in ("[deleted]", "[removed]"):
+                if comment_id in existing_data:
+                    if comment_id not in written_to_inprogress:
+                        inprogress_file.write(existing_data[comment_id].to_tsv_row() + "\n")
+                        inprogress_file.flush()
+                        written_to_inprogress.add(comment_id)
+                continue
+
             body_hash = compute_body_hash(body)
             existing_row = existing_data.get(comment_id)
+
+            # Check if already known non-timeline
+            if comment_id in skipped_cache and skipped_cache[comment_id] == body_hash:
+                stats["skipped"] += 1
+                continue
 
             # Determine if we need to process this comment
             should_process = False
@@ -444,6 +471,7 @@ def main():
 
             if new_row is None:
                 stats["skipped"] += 1
+                skipped_cache[comment_id] = body_hash  # Remember non-timeline
                 # Remove from data if it was previously there but now should be skipped
                 if comment_id in existing_data:
                     del existing_data[comment_id]
@@ -485,6 +513,14 @@ def main():
     # Now sort the inprogress file and write final output
     print("\n" + "="*60)
     print("📝 Finalizing output (sorting by comment ID)...")
+
+    # Write skipped cache
+    try:
+        with open(skipped_file, "w") as f:
+            for cid in sorted(skipped_cache.keys()):
+                f.write(f"{cid}\t{skipped_cache[cid]}\n")
+    except Exception as e:
+        print(f"[warn] Could not write skipped cache: {e}", file=sys.stderr)
 
     try:
         # Read all rows from inprogress file
