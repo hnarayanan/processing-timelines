@@ -7,7 +7,7 @@ Usage:
   OPENAI_API_KEY=... python extract_timelines.py input.json output.tsv --model gpt-4o-mini
 
 Env:
-  OPENAI_MODEL (default: gpt-5)
+  OPENAI_MODEL (default: gpt-5.1)
   RATE_LIMIT_DELAY_SEC (default: 0.1)
 """
 
@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1")
 RATE_LIMIT_DELAY_SEC = float(os.environ.get("RATE_LIMIT_DELAY_SEC", "0.1"))
 
 SYSTEM_PROMPT = """You are a careful information normaliser. Extract exactly ONE timeline row
